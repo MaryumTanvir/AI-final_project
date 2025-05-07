@@ -95,12 +95,8 @@ while not shutdownClient:
         currentStep += 1
         if currentStep != arguments.max_steps:
             if buf:
-                
-                # Function For Automated Driving
-                buf = d.drive(buf) 
-
-                # Function For Manual Arrow Keys Driving
-                #buf = d.drive_manual(buf)
+                #buf = d.drive(buf) 
+                buf = d.drive_manual(buf)
 
         else:
             buf = '(meta 1)'

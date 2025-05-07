@@ -65,7 +65,7 @@ class CarControl(object):
     
     def getFocus(self):
         return self.focus
-    
+
     def setMeta(self, meta):
         self.meta = meta
     

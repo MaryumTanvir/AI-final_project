@@ -31,7 +31,7 @@ class Driver(object):
         self.control = carControl.CarControl()
         
         self.steer_lock = 0.785398
-        self.max_speed = 110
+        self.max_speed = 100
         self.prev_rpm = None
         self.reverse_gear = False  # Flag for reverse mode
         self.init_data_logging()
@@ -228,7 +228,3 @@ class Driver(object):
         self.control.setAccel(self.ataccel)
         self.control.setBrake(self.atbrake)
         self.control.setSteer(self.atsteer)
-
-
-# ORIGINALLLL HEREE
-#HEHE
