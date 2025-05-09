@@ -1,177 +1,192 @@
 import os
 import numpy as np
 import joblib
-import csv
 import tensorflow as tf
-from tensorflow.keras import layers, models
 
 import msgParser
 import carState
 import carControl
+from collections import deque
 
-# Constants
-LOG_FILE = "complete_driving_data.csv"
-BC_MODEL = "bc_model.keras"
-BC_SCALER = "bc_scaler.gz"
-BC_OUTPUT_SCALER = "bc_output_scaler.gz"
+# Constants for filenames
+BC_MODEL_FILE = "bc_model.keras"
+BC_SCALER_FILE = "bc_scaler.gz"
+BC_OUTPUT_SCALER_FILE = "bc_output_scaler.gz"
 
-# Driver Class
+
 class Driver:
-    def __init__(self, stage: int, train: bool = False):
-        self.stage = stage
-        self.train_mode = train
+    def __init__(self, stage: int = 3, train: bool = False):
+        """Initialize the Driver with or without training mode. 
+        Loads the behavior cloning model and scalers if available."""
+        self.stage = stage        # Unused in behavior cloning, but kept for compatibility
+        self.train_mode = train   # Unused (no RL training logic in this driver)
         self.parser = msgParser.MsgParser()
         self.state = carState.CarState()
         self.control = carControl.CarControl()
-        self.max_gear = 6
+        self.max_gear = 6  # maximum forward gear
+        self.seq_len = 5                   # model expects 5 frames
+        self.seq_buffer = deque(maxlen=self.seq_len)
 
         # Load Behavior Cloning model and scalers
         self.use_bc = False
-        self.bc_net = None
+        self.bc_model = None
         self.bc_scaler = None
         self.bc_output_scaler = None
-        if os.path.exists(BC_MODEL) and os.path.exists(BC_SCALER) and os.path.exists(BC_OUTPUT_SCALER):
+        if os.path.exists(BC_MODEL_FILE) and os.path.exists(BC_SCALER_FILE) and os.path.exists(BC_OUTPUT_SCALER_FILE):
             try:
-                self.bc_net = tf.keras.models.load_model(BC_MODEL)
-                self.bc_scaler = joblib.load(BC_SCALER)
-                self.bc_output_scaler = joblib.load(BC_OUTPUT_SCALER)
+                # Load trained Keras model
+                self.bc_model = tf.keras.models.load_model(BC_MODEL_FILE)
+                # Load pre-fitted scalers (using joblib for pickled StandardScaler objects)
+                self.bc_scaler = joblib.load(BC_SCALER_FILE)
+                self.bc_output_scaler = joblib.load(BC_OUTPUT_SCALER_FILE)
                 self.use_bc = True
-                print("\u2713 Behavior-cloning model and scalers loaded")
+                print("✓ Loaded behavior cloning model and scalers.")
             except Exception as e:
-                print(f"Warning: Failed to load BC model or scalers: {e}")
+                print(f"Warning: Failed to load BC model/scalers: {e}")
                 self.use_bc = False
+        else:
+            print("Warning: BC model or scalers not found. Running without behavior cloning.")
+            self.use_bc = False
 
-        # State tracking
-        self.start_steps = 0
-        self.initial_dist_raced = None
-        self.prev_steer = 0.0
-        self.stuck_steps = 0
-
-    def get_state_vec(self):
-        track = self.state.track or [0.0] * 19
-        opponents = self.state.opponents or [0.0] * 36
-        wheelSpinVel = self.state.wheelSpinVel or [0.0] * 4
-        state_vec = [
-            self.state.angle or 0.0,
-            self.state.trackPos or 0.0,
-            self.state.getSpeedX() or 0.0,
-            self.state.getSpeedY() or 0.0,
-            self.state.getSpeedZ() or 0.0,
-            self.state.getRpm() or 0.0,
-            self.state.z or 0.0,
-            *wheelSpinVel,
-            *track,
-            *opponents
-        ]
-        return np.array(state_vec, dtype=np.float32)
-
-    def bc_action(self):
-        if not self.use_bc:
-            return 0.0, 0.0, 0.0, 0.0, 1, 0.0
-
-        s_vec = self.get_state_vec()
-        try:
-            X = self.bc_scaler.transform(s_vec[None, :])
-            prediction_scaled = self.bc_net.predict(X, verbose=0)[0]
-            prediction = self.bc_output_scaler.inverse_transform([prediction_scaled])[0]
-            steer, accel, brake, clutch, gear, meta = prediction
-
-            steer = -float(np.clip(steer, -1, 1))
-            accel = float(np.clip(accel, 0, 1))
-            brake = float(np.clip(brake, 0, 1))
-            clutch = float(np.clip(clutch, 0, 1))
-            gear = int(round(max(1, min(self.max_gear, gear))))
-            meta = float(np.clip(meta, 0, 1))
-
-            steer = self.prev_steer * 0.95 + steer * 0.05
-            self.prev_steer = steer
-
-            if self.state.track and self.state.track[9] < 4.0:
-                steer = 0.5 if (self.state.trackPos or 0) > 0 else -0.5
-                accel = 0.3
-                meta = 1.0
-
-            return steer, accel, brake, clutch, gear, meta
-        except Exception as e:
-            print(f"Error in bc_action: {e}. Using default actions.")
-            return 0.0, 0.0, 0.0, 0.0, 1, 0.0
-
-    def init(self):
+    def init(self) -> str:
+        """Build the init string to configure sensors (19 track sensors at specified angles)."""
+        # 19 track sensor angles from -90 to 90 degrees (inclusive) in 10-degree increments
         angles = [-90 + i * 10 for i in range(19)]
         return self.parser.stringify({'init': angles})
 
-    def drive(self, msg: str):
+    def _get_state_vector(self) -> np.ndarray:
+        """Compile the current car state into the 70-dim feature vector the BC model expects."""
+        # Basic safety: fill any missing sensor arrays with zeros
+        track      = self.state.track if self.state.track is not None else [0.0] * 19
+        opponents  = self.state.opponents if self.state.opponents is not None else [0.0] * 36
+        wheel_spin = self.state.wheelSpinVel if self.state.wheelSpinVel is not None else [0.0] * 4
+
+        # Core scalar features
+        angle     = self.state.angle      or 0.0
+        track_pos = self.state.trackPos   or 0.0
+        speed_x   = self.state.getSpeedX() or 0.0
+        speed_y   = self.state.getSpeedY() or 0.0
+        speed_z   = self.state.getSpeedZ() or 0.0
+        rpm       = self.state.getRpm()    or 0.0
+        z         = self.state.z           or 0.0
+        fuel      = getattr(self.state, "fuel", 0.0)  # 0.0 if fuel not in telemetry
+
+        # Derived track-sensor averages (same as in training script)
+        left_avg   = float(np.mean(track[:6]))
+        mid_avg    = float(np.mean(track[6:13]))
+        right_avg  = float(np.mean(track[13:]))
+
+        # Assemble feature vector in *exact* training order
+        state_vector = [
+            angle, track_pos, speed_x, speed_y, speed_z, rpm, z, fuel,
+            *wheel_spin,           # 4
+            *track,                # 19
+            *opponents,            # 36
+            left_avg, mid_avg, right_avg  # 3 derived
+        ]
+        assert len(state_vector) == 70, f"Feature vector length mismatch: {len(state_vector)}"
+        return np.array(state_vector, dtype=np.float32)
+
+
+    def bc_action(self):
+        """
+        Use the behavior-cloning network to predict (steer, accel, brake, clutch, gear, meta).
+        Returns six values ready to be copied into self.control.*
+        """
+        # If the BC model isn't loaded, return a "do nothing" action
+        if not self.use_bc:
+            return 0.0, 0.0, 0.0, 0.0, 1, 0
+
+        try:
+            # ------------------------------------------------------------------
+            # 1. Build raw 70-feature vector and scale it
+            # ------------------------------------------------------------------
+            raw_vec = self._get_state_vector().reshape(1, -1)     # (1, 70)
+            scaled_vec = self.bc_scaler.transform(raw_vec)[0]     # (70,)
+
+            # ------------------------------------------------------------------
+            # 2. Maintain rolling buffer of the last 5 frames
+            #    Prefill buffer on first call so it always has seq_len elements
+            # ------------------------------------------------------------------
+            if len(self.seq_buffer) == 0:
+                for _ in range(self.seq_len):
+                    self.seq_buffer.append(scaled_vec.copy())      # same frame
+            else:
+                self.seq_buffer.append(scaled_vec)
+
+            # Stack to shape (1, 5, 70) for the network
+            seq_input = np.stack(self.seq_buffer, axis=0).reshape(1, self.seq_len, -1)
+
+            # ------------------------------------------------------------------
+            # 3. Predict, then inverse-scale to original action space
+            # ------------------------------------------------------------------
+            y_scaled = self.bc_model.predict(seq_input, verbose=0)        # (1, 6)
+            action   = self.bc_output_scaler.inverse_transform(y_scaled)[0]  # (6,)
+
+        except Exception as e:
+            print(f"[BC] Prediction error: {e}.  Using default control outputs.")
+            return 0.0, 0.0, 0.0, 0.0, 1, 0
+
+        # ------------------------------------------------------------------
+        # 4. Post-process & clamp each control value
+        # ------------------------------------------------------------------
+        steer, accel, brake, clutch, gear, meta = action
+
+        # Steering: model was trained with opposite sign → negate, clamp
+        steer  = float(np.clip(-steer, -1.0,  1.0))
+
+        # Pedals & clutch: [0, 1]
+        accel  = float(np.clip(accel,  0.0,  1.0))
+        brake  = float(np.clip(brake,  0.0,  1.0))
+        clutch = float(np.clip(clutch, 0.0,  1.0))
+
+        # Gear: round to nearest int in [1, max_gear]
+        try:
+            gear = int(round(gear))
+        except Exception:
+            gear = int(gear) if isinstance(gear, (int, np.integer)) else 1
+        gear = max(1, min(self.max_gear, gear))
+
+        # Meta: convert to 0 or 1
+        meta = int(meta >= 0.5)
+
+        return steer, accel, brake, clutch, gear, meta
+
+    def drive(self, msg: str) -> str:
+        """Main driving function called every time step with sensor data `msg`.
+        Parses the sensor data, computes control actions, and returns a command string."""
+        # Update the CarState from the incoming message string
         self.state.setFromMsg(msg)
 
-        if self.initial_dist_raced is None:
-            self.initial_dist_raced = self.state.distRaced or 0.0
+        # Get the model-predicted action (or default if no model)
+        steer, accel, brake, clutch, gear, meta = self.bc_action()
 
-        dist_moved = (self.state.distRaced or 0.0) - self.initial_dist_raced
-        if dist_moved < 1.0 and self.start_steps < 100:
-            self.control.clutch = 1.0
-            self.control.gear = 1
-            self.start_steps += 1
-        else:
-            steer, accel, brake, clutch, gear, meta = self.bc_action()
-            self.control.clutch = clutch
-            self.control.gear = gear
+        # Apply the predicted control values to the CarControl object
+        self.control.steer = steer
+        self.control.accel = accel
+        self.control.brake = brake
+        self.control.clutch = clutch
+        self.control.gear = gear
+        self.control.meta = meta
 
-            track_pos = self.state.trackPos or 0.0
-            speed_x = self.state.getSpeedX() or 0.0
-            if (abs(speed_x) < 1.0 and accel > 0.5 and abs(track_pos) > 0.8) or meta > 0.5:
-                self.stuck_steps += 1
-            else:
-                self.stuck_steps = 0
+        # (Optional) Print or log some info for debugging/monitoring
+        # print(f"steer={steer:.3f}, accel={accel:.3f}, brake={brake:.3f}, gear={gear}, meta={meta}")
 
-            if self.stuck_steps > 20:
-                accel = -0.5
-                brake = 0.0
-                steer = -0.5 if track_pos > 0 else 0.5
-                self.control.gear = -1
-                self.stuck_steps = 0
-
-            self.control.steer = steer
-            self.control.accel = max(accel, 0.0)
-            self.control.brake = max(brake, 0.0)
-            self.control.meta = int(meta)
-
-        track_sensors = self.state.track or [0.0] * 19
-        print(f"Step {self.start_steps}: distRaced={self.state.distRaced:.4f}, speedX={self.state.getSpeedX():.4f}, "
-              f"steer={self.control.steer:+.3f}, accel={self.control.accel:.3f}, gear={self.control.gear}, clutch={self.control.clutch:.3f}, "
-              f"trackPos={self.state.trackPos or 0.0:+.3f}, angle={self.state.angle or 0.0:+.3f}, "
-              f"trackSensors={track_sensors[:5]}")
-
-        log_row(self.state, self.control)
+        # Return the control action as a message string for TORCS
         return self.control.toMsg()
 
-    def save_model(self):
-        pass
-
     def onShutDown(self):
+        """Called when the simulation is shutting down. Clean up if needed."""
+        # No special cleanup required (we could close files or save logs here if any)
         pass
 
     def onRestart(self):
-        self.start_steps = 0
-        self.initial_dist_raced = None
-        self.prev_steer = 0.0
-        self.stuck_steps = 0
+        """Called when an episode restarts. Reset any necessary state."""
+        # Nothing to reset in pure BC mode (no persistent episode state kept)
+        pass
 
-# Logging
-def log_row(state_obj, control_obj):
-    s = state_obj.get_all_state_data()
-    a = {
-        'steer': control_obj.steer,
-        'gear': control_obj.gear,
-        'accel': control_obj.accel,
-        'brake': control_obj.brake,
-        'clutch': control_obj.clutch,
-        'meta': control_obj.meta
-    }
-    row = {**s, **a}
-    file_exists = os.path.exists(LOG_FILE)
-    file_empty = file_exists and os.path.getsize(LOG_FILE) == 0
-    with open(LOG_FILE, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
-        if not file_exists or file_empty:
-            writer.writeheader()
-        writer.writerow(row)
+    def reward(self):
+        """[Optional] Compute a reward for training (not used in BC inference mode)."""
+        # In pure behavior cloning, we don't use a reward function.
+        # This is just a placeholder to avoid errors if called in training mode.
+        return 0.0
