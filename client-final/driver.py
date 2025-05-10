@@ -62,95 +62,84 @@ class Driver:
         wheel_spin = self.state.wheelSpinVel if self.state.wheelSpinVel is not None else [0.0] * 4
 
         # Core scalar features
-        angle     = self.state.angle      or 0.0
-        track_pos = self.state.trackPos   or 0.0
-        speed_x   = self.state.getSpeedX() or 0.0
-        speed_y   = self.state.getSpeedY() or 0.0
-        speed_z   = self.state.getSpeedZ() or 0.0
-        rpm       = self.state.getRpm()    or 0.0
-        z         = self.state.z           or 0.0
-        fuel      = getattr(self.state, "fuel", 0.0)  # 0.0 if fuel not in telemetry
+        angle       = self.state.angle or 0.0
+        track_pos   = self.state.trackPos or 0.0
+        speed_x     = self.state.getSpeedX() or 0.0
+        speed_y     = self.state.getSpeedY() or 0.0
+        speed_z     = self.state.getSpeedZ() or 0.0
+        rpm         = self.state.getRpm() or 0.0
+        z           = self.state.z or 0.0
+        fuel        = getattr(self.state, "fuel", 0.0)
+        clutch      = getattr(self.state, "clutch", 0.0)
+        race_pos    = getattr(self.state, "racePos", 0.0)  # optional
 
-        # Derived track-sensor averages (same as in training script)
-        left_avg   = float(np.mean(track[:6]))
-        mid_avg    = float(np.mean(track[6:13]))
-        right_avg  = float(np.mean(track[13:]))
+        # Derived track-sensor averages (Track_1 to Track_19)
+        left_avg   = float(np.mean(track[0:6]))   # Track_1 to Track_6
+        mid_avg    = float(np.mean(track[6:13]))  # Track_7 to Track_13
+        right_avg  = float(np.mean(track[13:19])) # Track_14 to Track_19
 
-        # Assemble feature vector in *exact* training order
+        # Assemble feature vector in exact training order
         state_vector = [
-            angle, track_pos, speed_x, speed_y, speed_z, rpm, z, fuel,
-            *wheel_spin,           # 4
-            *track,                # 19
-            *opponents,            # 36
-            left_avg, mid_avg, right_avg  # 3 derived
+            angle, track_pos, speed_x, speed_y, speed_z, rpm, z, fuel, clutch,
+            *wheel_spin,         # WheelSpinVelocity_1 to 4
+            *track,              # Track_1 to Track_19
+            *opponents,          # Opponent_1 to Opponent_36
+            race_pos,            # RacePosition
+            left_avg, mid_avg, right_avg  # Aggregates
         ]
+
         assert len(state_vector) == 70, f"Feature vector length mismatch: {len(state_vector)}"
         return np.array(state_vector, dtype=np.float32)
 
-
     def bc_action(self):
         """
-        Use the behavior-cloning network to predict (steer, accel, brake, clutch, gear, meta).
-        Returns six values ready to be copied into self.control.*
+        Use the behavior-cloning network to predict (steer, accel, brake, clutch, gear).
+        Returns five values ready to be copied into self.control.* (meta = 0 by default).
         """
-        # If the BC model isn't loaded, return a "do nothing" action
         if not self.use_bc:
-            return 0.0, 0.0, 0.0, 0.0, 1, 0
+            return 0.0, 0.0, 0.0, 0.0, 1  # default values if model is not loaded
 
         try:
-            # ------------------------------------------------------------------
-            # 1. Build raw 70-feature vector and scale it
-            # ------------------------------------------------------------------
-            raw_vec = self._get_state_vector().reshape(1, -1)     # (1, 70)
-            scaled_vec = self.bc_scaler.transform(raw_vec)[0]     # (70,)
+            # Step 1: Get current feature vector and scale it
+            raw_vec = self._get_state_vector().reshape(1, -1)  # shape (1, 70)
+            scaled_vec = self.bc_scaler.transform(raw_vec)[0]  # shape (70,)
 
-            # ------------------------------------------------------------------
-            # 2. Maintain rolling buffer of the last 5 frames
-            #    Prefill buffer on first call so it always has seq_len elements
-            # ------------------------------------------------------------------
+            # Step 2: Fill sequence buffer with scaled input
             if len(self.seq_buffer) == 0:
                 for _ in range(self.seq_len):
-                    self.seq_buffer.append(scaled_vec.copy())      # same frame
+                    self.seq_buffer.append(scaled_vec.copy())
             else:
                 self.seq_buffer.append(scaled_vec)
 
-            # Stack to shape (1, 5, 70) for the network
+            # Step 3: Format sequence input to (1, 5, 70) and predict
             seq_input = np.stack(self.seq_buffer, axis=0).reshape(1, self.seq_len, -1)
-
-            # ------------------------------------------------------------------
-            # 3. Predict, then inverse-scale to original action space
-            # ------------------------------------------------------------------
-            y_scaled = self.bc_model.predict(seq_input, verbose=0)        # (1, 6)
-            action   = self.bc_output_scaler.inverse_transform(y_scaled)[0]  # (6,)
+            y_scaled = self.bc_model.predict(seq_input, verbose=0)  # shape (1, 5)
+            action = self.bc_output_scaler.inverse_transform(y_scaled)[0]  # shape (5,)
 
         except Exception as e:
-            print(f"[BC] Prediction error: {e}.  Using default control outputs.")
-            return 0.0, 0.0, 0.0, 0.0, 1, 0
+            print(f"[BC] Prediction error: {e}. Using fallback control.")
+            return 0.0, 0.0, 0.0, 0.0, 1
 
-        # ------------------------------------------------------------------
-        # 4. Post-process & clamp each control value
-        # ------------------------------------------------------------------
-        steer, accel, brake, clutch, gear, meta = action
+        # Unpack predicted outputs
+        steer, accel, brake, clutch, gear = action
 
-        # Steering: model was trained with opposite sign → negate, clamp
-        steer  = float(np.clip(-steer, -1.0,  1.0))
+        # Post-process each control
+        steer  = float(np.clip(-steer, -1.0, 1.0))  # negate because training used reversed steering
+        accel  = float(np.clip(accel, 0.0, 1.0))
+        brake  = float(np.clip(brake, 0.0, 1.0))
+        clutch = float(np.clip(clutch, 0.0, 1.0))
 
-        # Pedals & clutch: [0, 1]
-        accel  = float(np.clip(accel,  0.0,  1.0))
-        brake  = float(np.clip(brake,  0.0,  1.0))
-        clutch = float(np.clip(clutch, 0.0,  1.0))
-
-        # Gear: round to nearest int in [1, max_gear]
+        # Gear: clean rounding + safety
+        if not np.isfinite(gear):
+            gear = 1
         try:
             gear = int(round(gear))
         except Exception:
             gear = int(gear) if isinstance(gear, (int, np.integer)) else 1
         gear = max(1, min(self.max_gear, gear))
 
-        # Meta: convert to 0 or 1
-        meta = int(meta >= 0.5)
+        return steer, accel, brake, clutch, gear
 
-        return steer, accel, brake, clutch, gear, meta
 
     def drive(self, msg: str) -> str:
         """Main driving function called every time step with sensor data `msg`.
@@ -159,7 +148,7 @@ class Driver:
         self.state.setFromMsg(msg)
 
         # Get the model-predicted action (or default if no model)
-        steer, accel, brake, clutch, gear, meta = self.bc_action()
+        steer, accel, brake, clutch, gear = self.bc_action()
 
         # Apply the predicted control values to the CarControl object
         self.control.steer = steer
@@ -167,8 +156,7 @@ class Driver:
         self.control.brake = brake
         self.control.clutch = clutch
         self.control.gear = gear
-        self.control.meta = meta
-
+        
         # (Optional) Print or log some info for debugging/monitoring
         # print(f"steer={steer:.3f}, accel={accel:.3f}, brake={brake:.3f}, gear={gear}, meta={meta}")
 
