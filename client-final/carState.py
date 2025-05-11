@@ -29,6 +29,8 @@ class CarState(object):
         self.trackPos = None
         self.wheelSpinVel = None
         self.z = None
+        self.clutch = None
+
     
     def setFromMsg(self, str_sensors):
         self.sensors = self.parser.parse(str_sensors)
@@ -52,6 +54,8 @@ class CarState(object):
         self.setTrackPosD()
         self.setWheelSpinVelD()
         self.setZD()
+        self.setClutchD()
+
     
     def toMsg(self):
         self.sensors = {}
@@ -77,6 +81,11 @@ class CarState(object):
         self.sensors['z'] = [self.z]
         
         return self.parser.stringify(self.sensors)
+    
+    
+    def setClutchD(self):
+        self.clutch = self.getFloatD('clutch')
+
     
     def get_all_state_data(self):
         return {

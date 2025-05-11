@@ -49,47 +49,71 @@ class Driver:
             self.use_bc = False
 
     def init(self) -> str:
-        """Build the init string to configure sensors (19 track sensors at specified angles)."""
-        # 19 track sensor angles from -90 to 90 degrees (inclusive) in 10-degree increments
+        """Build the init string to configure sensors."""
         angles = [-90 + i * 10 for i in range(19)]
-        return self.parser.stringify({'init': angles})
+        return self.parser.stringify({
+            'init': angles
+              
+        })
+
 
     def _get_state_vector(self) -> np.ndarray:
-        """Compile the current car state into the 70-dim feature vector the BC model expects."""
-        # Basic safety: fill any missing sensor arrays with zeros
-        track      = self.state.track if self.state.track is not None else [0.0] * 19
-        opponents  = self.state.opponents if self.state.opponents is not None else [0.0] * 36
-        wheel_spin = self.state.wheelSpinVel if self.state.wheelSpinVel is not None else [0.0] * 4
+        """Compile the current car state into the 76-dim feature vector the BC model expects."""
 
-        # Core scalar features
-        angle       = self.state.angle or 0.0
-        track_pos   = self.state.trackPos or 0.0
-        speed_x     = self.state.getSpeedX() or 0.0
-        speed_y     = self.state.getSpeedY() or 0.0
-        speed_z     = self.state.getSpeedZ() or 0.0
-        rpm         = self.state.getRpm() or 0.0
-        z           = self.state.z or 0.0
-        fuel        = getattr(self.state, "fuel", 0.0)
-        clutch      = getattr(self.state, "clutch", 0.0)
-        race_pos    = getattr(self.state, "racePos", 0.0)  # optional
+        try:
+            # 1. Sensor arrays with safety defaults
+            track = self.state.getTrack() or [0.0] * 19
+            opponents = self.state.getOpponents() or [0.0] * 36
+            wheel_spin = self.state.getWheelSpinVel() or [0.0] * 4
 
-        # Derived track-sensor averages (Track_1 to Track_19)
-        left_avg   = float(np.mean(track[0:6]))   # Track_1 to Track_6
-        mid_avg    = float(np.mean(track[6:13]))  # Track_7 to Track_13
-        right_avg  = float(np.mean(track[13:19])) # Track_14 to Track_19
+            # 2. Core scalars with fallback to 0.0
+            angle = self.state.getAngle() or 0.0
+            track_pos = self.state.getTrackPos() or 0.0
+            speed_x = self.state.getSpeedX() or 0.0
+            speed_y = self.state.getSpeedY() or 0.0
+            speed_z = self.state.getSpeedZ() or 0.0
+            rpm = self.state.getRpm() or 0.0
+            z = self.state.getZ() or 0.0
+            fuel = self.state.getFuel() or 0.0
+            clutch = self.state.clutch or 0.0  # no getter, uses direct access
+            race_pos = self.state.getRacePos() or 0.0
+            gear = self.state.getGear() or 1
 
-        # Assemble feature vector in exact training order
-        state_vector = [
-            angle, track_pos, speed_x, speed_y, speed_z, rpm, z, fuel, clutch,
-            *wheel_spin,         # WheelSpinVelocity_1 to 4
-            *track,              # Track_1 to Track_19
-            *opponents,          # Opponent_1 to Opponent_36
-            race_pos,            # RacePosition
-            left_avg, mid_avg, right_avg  # Aggregates
-        ]
+            # 3. Optional scalars (normalized)
+            current_lap_time = self.state.getCurLapTime() or 0.0
+            distance_covered = self.state.getDistRaced() or 0.0
+            distance_from_start = self.state.getDistFromStart() or 0.0
 
-        assert len(state_vector) == 70, f"Feature vector length mismatch: {len(state_vector)}"
-        return np.array(state_vector, dtype=np.float32)
+            # Normalize time and distances
+            current_lap_time /= 100.0
+            distance_covered /= 10000.0
+            distance_from_start /= 10000.0
+
+            # 4. Derived averages
+            left_avg = float(np.mean(track[0:6]))
+            mid_avg = float(np.mean(track[6:13]))
+            right_avg = float(np.mean(track[13:19]))
+
+            # 5. Final state vector
+            state_vector = [
+                angle, track_pos, speed_x, speed_y, speed_z, rpm, z, fuel, clutch,
+                *wheel_spin, *track, *opponents,
+                race_pos,
+                left_avg, mid_avg, right_avg,
+                current_lap_time, distance_covered, distance_from_start,
+                gear
+            ]
+
+            if len(state_vector) != 76:
+                raise ValueError(f"Expected 76 features, got {len(state_vector)}")
+
+            return np.array(state_vector, dtype=np.float32)
+
+        except Exception as e:
+            print(f"[ERROR] _get_state_vector failed: {e}")
+            raise
+
+
 
     def bc_action(self):
         """
@@ -97,6 +121,7 @@ class Driver:
         Returns five values ready to be copied into self.control.* (meta = 0 by default).
         """
         if not self.use_bc:
+            print("not loaded!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             return 0.0, 0.0, 0.0, 0.0, 1  # default values if model is not loaded
 
         try:
@@ -124,7 +149,7 @@ class Driver:
         steer, accel, brake, clutch, gear = action
 
         # Post-process each control
-        steer  = float(np.clip(-steer, -1.0, 1.0))  # negate because training used reversed steering
+        steer  = float(np.clip(steer, -1.0, 1.0))  # negate because training used reversed steering
         accel  = float(np.clip(accel, 0.0, 1.0))
         brake  = float(np.clip(brake, 0.0, 1.0))
         clutch = float(np.clip(clutch, 0.0, 1.0))
